@@ -123,225 +123,6 @@ def tg_send_message(token, chat_id, text):
     return _http_json(url, method="POST", body={"chat_id": chat_id, "text": text}, timeout=30)
 
 
-# ───────────────────────────── LLM Providers ─────────────────────────────
-def call_claude(api_key, system_prompt, user_text):
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
-    body = {"model": CLAUDE_MODEL, "max_tokens": CLAUDE_MAX_TOKENS,
-            "messages": [{"role": "user", "content": user_text}]}
-    if system_prompt:
-        body["system"] = system_prompt
-    data = _http_json(url, method="POST", headers=headers, body=body, timeout=120)
-    parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-    return "".join(parts).strip() or "(Claude trả lời rỗng)"
-
-
-def call_gemini(api_key, system_prompt, user_text):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % GEMINI_MODEL
-    headers = {"x-goog-api-key": api_key}
-    body = {"contents": [{"role": "user", "parts": [{"text": user_text}]}],
-            "generationConfig": {"maxOutputTokens": GEMINI_MAX_TOKENS}}
-    if system_prompt:
-        body["system_instruction"] = {"parts": [{"text": system_prompt}]}
-    data = _http_json(url, method="POST", headers=headers, body=body, timeout=120)
-    candidates = data.get("candidates", [])
-    if not candidates:
-        block = (data.get("promptFeedback") or {}).get("blockReason")
-        return "(Gemini không trả candidate%s)" % (" — blocked: %s" % block if block else "")
-    parts = (candidates[0].get("content") or {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts).strip() or "(Gemini trả lời rỗng)"
-
-
-def call_gpt(api_key, system_prompt, user_text):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": "Bearer %s" % api_key}
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_text})
-    body = {"model": GPT_MODEL, "messages": messages, "max_tokens": GPT_MAX_TOKENS}
-    data = _http_json(url, method="POST", headers=headers, body=body, timeout=120)
-    choices = data.get("choices", [])
-    if not choices:
-        return "(GPT không trả choice)"
-    return (choices[0].get("message", {}).get("content") or "").strip() or "(GPT trả lời rỗng)"
-
-
-def call_llm(provider, api_key, system_prompt, user_text):
-    if provider == "Claude":
-        return call_claude(api_key, system_prompt, user_text)
-    if provider == "Gemini":
-        return call_gemini(api_key, system_prompt, user_text)
-    if provider == "GPT":
-        return call_gpt(api_key, system_prompt, user_text)
-    return "(provider lạ: %s)" % provider
-
-
-# ───────────────────────────── Background Worker (1 / token) ─────────────────────────────
-class TokenWorker(threading.Thread):
-    def __init__(self, token, entries, log_cb, skip_backlog):
-        super().__init__(daemon=True)
-        self.token = token
-        self.log = log_cb
-        self.skip_backlog = skip_backlog
-        self.stop_event = threading.Event()
-        self.bot_id = token.split(":")[0]
-        self.offset_file = DATA_DIR / (".offset_%s" % self.bot_id)
-        self.lock_file = DATA_DIR / ("forge_%s.lock" % self.bot_id)
-        self.entries_by_chat = {str(e["chat_id"]): e for e in entries}
-
-    def _read_offset(self):
-        try:
-            return int(self.offset_file.read_text().strip())
-        except Exception:
-            return None
-
-    def _write_offset(self, value):
-        try:
-            self.offset_file.write_text(str(value))
-        except Exception as e:
-            self.log("⚠ [#%s] không ghi offset: %s" % (self.bot_id, e))
-
-    def _acquire_lock(self):
-        try:
-            if self.lock_file.exists():
-                old = self.lock_file.read_text().strip()
-                if old and old.isdigit() and int(old) != os.getpid() and _pid_alive(int(old)):
-                    self.log("⛔ Token #%s đang được tiến trình khác (PID %s) poll — "
-                             "tránh 409, không chạy đè." % (self.bot_id, old))
-                    return False
-            self.lock_file.write_text(str(os.getpid()))
-            return True
-        except Exception as e:
-            self.log("⚠ [#%s] không tạo lock (%s) — chạy tiếp." % (self.bot_id, e))
-            return True
-
-    def _release_lock(self):
-        try:
-            if self.lock_file.exists() and self.lock_file.read_text().strip() == str(os.getpid()):
-                self.lock_file.unlink()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _route_passes(role, is_default, text):
-        low = (text or "").strip().lower()
-        if low.startswith("@all") or low.startswith("@both"):
-            return True
-        if low.startswith("@"):
-            tag = "".join(ch for ch in low.split()[0][1:] if ch.isalnum() or ch == "_")
-            return bool(role) and tag == role.lower()
-        return bool(is_default)
-
-    def _drain_backlog(self):
-        try:
-            data = tg_get_updates(self.token, None, 0)
-            results = data.get("result", [])
-            if results:
-                offset = results[-1]["update_id"] + 1
-                self._write_offset(offset)
-                self.log("⏭ [#%s] bỏ qua %d tin cũ (backlog)." % (self.bot_id, len(results)))
-                return offset
-            self.log("⏭ [#%s] không có backlog." % self.bot_id)
-        except Exception as e:
-            self.log("⚠ [#%s] không drain được backlog: %s" % (self.bot_id, e))
-        return None
-
-    def _process_message(self, update):
-        msg = update.get("message") or {}
-        if (msg.get("from") or {}).get("is_bot"):
-            return
-        chat_id = str((msg.get("chat") or {}).get("id"))
-        entry = self.entries_by_chat.get(chat_id)
-        if not entry:
-            return
-        text = msg.get("text") or "(non-text)"
-        if not self._route_passes(entry.get("role", ""), entry.get("is_default", False), text):
-            return
-        self._reply(entry, msg, text)
-
-    def _reply(self, entry, msg, text):
-        frm = msg.get("from", {})
-        sender = frm.get("username") or frm.get("first_name") or "user"
-        tag = entry.get("role") or "default"
-        self.log("📩 [%s] %s: %s" % (tag, sender, text))
-        try:
-            reply = call_llm(entry["provider"], entry["api_key"],
-                             entry.get("system_prompt", ""), text)
-        except urllib.error.HTTPError as e:
-            self.log("❌ [%s] %s API HTTP %s: %s"
-                     % (tag, entry["provider"], e.code, _read_http_error(e)))
-            return
-        except Exception as e:
-            self.log("❌ [%s] gọi %s lỗi: %s" % (tag, entry["provider"], e))
-            return
-        self.log("🤖 [%s] %s" % (tag, reply))
-        for chunk in _split_chunks(reply, TELEGRAM_TEXT_LIMIT):
-            try:
-                r = tg_send_message(self.token, entry["chat_id"], chunk)
-                if not r.get("ok"):
-                    self.log("⚠ [%s] sendMessage: %s" % (tag, r))
-            except Exception as e:
-                self.log("❌ [%s] không gửi được: %s" % (tag, e))
-                break
-
-    def run(self):
-        if not self._acquire_lock():
-            self.log("⏹️ [#%s] dừng (lock bận)." % self.bot_id)
-            return
-        groups = ", ".join("%s@%s" % (e.get("role") or "default", e.get("group_name") or c)
-                           for c, e in self.entries_by_chat.items())
-        self.log("▶️ Token #%s bắt đầu — phục vụ: %s" % (self.bot_id, groups))
-        try:
-            offset = self._read_offset()
-            if self.skip_backlog and offset is None:
-                offset = self._drain_backlog()
-
-            while not self.stop_event.is_set():
-                try:
-                    data = tg_get_updates(self.token, offset, LONG_POLL_SECONDS)
-                except urllib.error.HTTPError as e:
-                    if e.code == 409:
-                        self.log("⚠ [#%s] 409 Conflict — có poller khác trên cùng token." % self.bot_id)
-                    else:
-                        self.log("⚠ [#%s] getUpdates HTTP %s: %s"
-                                 % (self.bot_id, e.code, _read_http_error(e)))
-                    if self.stop_event.wait(BACKOFF_SECONDS):
-                        break
-                    continue
-                except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
-                    self.log("⚠ [#%s] mất mạng: %s — thử lại sau %ds"
-                             % (self.bot_id, e, BACKOFF_SECONDS))
-                    if self.stop_event.wait(BACKOFF_SECONDS):
-                        break
-                    continue
-                except Exception as e:
-                    self.log("⚠ [#%s] lỗi getUpdates: %s" % (self.bot_id, e))
-                    if self.stop_event.wait(BACKOFF_SECONDS):
-                        break
-                    continue
-
-                if not data.get("ok", False):
-                    self.log("⚠ [#%s] getUpdates báo lỗi: %s"
-                             % (self.bot_id, data.get("description", data)))
-                    if self.stop_event.wait(BACKOFF_SECONDS):
-                        break
-                    continue
-
-                last = None
-                for u in data.get("result", []):
-                    last = u.get("update_id")
-                    self._process_message(u)
-                if last is not None:
-                    offset = last + 1
-                    self._write_offset(offset)
-        except Exception as e:
-            self.log("💥 [#%s] lỗi nghiêm trọng: %s" % (self.bot_id, e))
-        finally:
-            self._release_lock()
-            self.log("⏹️ [#%s] poller dừng." % self.bot_id)
-
-
 # ───────────────────────────── PRESET team (~20 theme) ─────────────────────────────
 def _p(vai_tro, tinh_cach, giao_tiep, cach_noi, chuyen_mon):
     """Dựng system-prompt theo template bullet cố định (dễ customize)."""
@@ -748,434 +529,524 @@ def ghost_button(parent, text, command, width=120, danger=False, height=38):
                          border_width=1, border_color=bd, font=F(13))
 
 
-# ───────────────────────────── 1 bot = 1 hàng roster (BotRow) ─────────────────────────────
-class BotRow(ctk.CTkFrame):
-    """1 bot trong 1 group. Avatar emoji theo nhân vật. KHÔNG chứa Chat ID / tên group."""
-
-    def __init__(self, master, group, accent, data=None):
-        super().__init__(master, fg_color=THEME["surface2"], corner_radius=12,
-                         border_width=1, border_color=THEME["border"])
-        self.group = group
-        self.accent = accent
-        data = data or {}
-        self.grid_columnconfigure(1, weight=1)
-
-        self.avatar = ctk.CTkLabel(self, text=icon_for(data.get("role", "")), width=40, height=40,
-                                   corner_radius=20, fg_color=accent, text_color="#FFFFFF", font=F(19))
-        self.avatar.grid(row=0, column=0, padx=(12, 10), pady=(12, 4), sticky="w")
-        self.title_lbl = ctk.CTkLabel(self, text="Bot", anchor="w", font=F(15, "bold"),
-                                      text_color=THEME["text"])
-        self.title_lbl.grid(row=0, column=1, pady=(12, 4), sticky="w")
-        ctk.CTkButton(self, text="✕", width=30, height=28, corner_radius=8, fg_color="transparent",
-                      hover_color=THEME["surface"], text_color=THEME["danger"], border_width=1,
-                      border_color=THEME["border"], font=F(13),
-                      command=lambda: self.group._delete_bot(self)).grid(
-            row=0, column=2, padx=(0, 12), pady=(12, 4), sticky="e")
-
-        self.token = styled_entry(self, "Bot Token (123456:ABC… — mỗi bot 1 token)")
-        self.token.grid(row=1, column=0, columnspan=3, padx=12, pady=4, sticky="ew")
-
-        rowf = ctk.CTkFrame(self, fg_color="transparent")
-        rowf.grid(row=2, column=0, columnspan=3, padx=12, pady=4, sticky="ew")
-        rowf.grid_columnconfigure(1, weight=1)
-        self.provider = ctk.StringVar(value=data.get("provider", "Claude"))
-        styled_menu(rowf, PROVIDERS, self.provider, width=120).grid(row=0, column=0, padx=(0, 8), sticky="w")
-        self.role = styled_entry(rowf, "Role / @tag (vd: dev)")
-        self.role.grid(row=0, column=1, padx=(0, 8), sticky="ew")
-        self.role.bind("<KeyRelease>", lambda e: self._sync_title())
-        self.default = ctk.BooleanVar(value=data.get("is_default", False))
-        ctk.CTkSwitch(rowf, text="mặc định", variable=self.default, font=F(12),
-                      progress_color=accent, text_color=THEME["muted"], width=44).grid(
-            row=0, column=2, sticky="e")
-
-        self.apikey = styled_entry(self, "API Key của provider", show="•")
-        self.apikey.grid(row=3, column=0, columnspan=3, padx=12, pady=4, sticky="ew")
-
-        ctk.CTkLabel(self, text="System Prompt — nhân cách bot (sửa thoải mái)", anchor="w",
-                     text_color=THEME["muted"], font=F(11)).grid(
-            row=4, column=0, columnspan=3, padx=12, pady=(4, 0), sticky="w")
-        self.prompt = ctk.CTkTextbox(self, height=122, fg_color=THEME["bg"], text_color=THEME["text"],
-                                     border_color=THEME["border"], border_width=1, corner_radius=8, font=F(14))
-        self.prompt.grid(row=5, column=0, columnspan=3, padx=12, pady=(2, 12), sticky="ew")
-        # Lăn chuột trên textbox -> cuộn ROSTER (đừng để textbox nuốt event) — Tk9/macOS
-        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.prompt._textbox.bind(_seq, self.group.app._on_mousewheel)
-
-        self.set_data(data)
-
-    @staticmethod
-    def _fill(entry, value):
-        # KHÔNG đụng ô khi rỗng (get()=="" lúc placeholder hiện) -> giữ placeholder.
-        if entry.get():
-            entry.delete(0, "end")
-        if value:
-            entry.insert(0, value)
-
-    def _sync_title(self):
-        role = self.role.get().strip()
-        self.title_lbl.configure(text=role or "Bot")
-        self.avatar.configure(text=icon_for(role))
-
-    def set_data(self, d):
-        self._fill(self.token, d.get("token", ""))
-        self.provider.set(d.get("provider", "Claude"))
-        self._fill(self.role, d.get("role", ""))
-        self.default.set(bool(d.get("is_default", False)))
-        self._fill(self.apikey, d.get("api_key", ""))
-        self.prompt.delete("1.0", "end")
-        if d.get("system_prompt"):
-            self.prompt.insert("1.0", d.get("system_prompt", ""))
-        self._sync_title()
-
-    def to_dict(self):
-        return {
-            "token": self.token.get().strip(),
-            "provider": self.provider.get(),
-            "api_key": self.apikey.get().strip(),
-            "role": self.role.get().strip(),
-            "is_default": bool(self.default.get()),
-            "system_prompt": self.prompt.get("1.0", "end").strip(),
-        }
+# ───────────────────────────── Script kit nhúng sẵn (đọc từ kit gốc) ─────────────────────────────
+LISTEN_SH = "#!/usr/bin/env bash\n# listen.sh \u2014 block until a human message, print it, exit. The AGENT runs this in\n# the background; on a message it acts, replies via send.sh, and relaunches this.\nset -euo pipefail\n. \"$(dirname \"$0\")/config.sh\"\nHERE=\"$(dirname \"$0\")\"\n# Single-poller lock: two listeners on one bot = 409 Conflict = dropped messages.\nLOCK=\"${TMPDIR:-/tmp}/tg_listen_${BOT_NAME}.lock\"\nif [ -f \"$LOCK\" ]; then\n  OLD=\"$(cat \"$LOCK\" 2>/dev/null || true)\"\n  if [ -n \"${OLD:-}\" ] && [ \"$OLD\" != \"$$\" ] && kill -0 \"$OLD\" 2>/dev/null; then\n    kill \"$OLD\" 2>/dev/null || true; sleep 1\n  fi\nfi\necho \"$$\" > \"$LOCK\"\ntrap 'rm -f \"$LOCK\"' EXIT\nwhile :; do\n  out=\"$(\"$HERE/read.sh\" 2>/dev/null || true)\"\n  if [ -n \"$out\" ] && ! printf '%s' \"$out\" | grep -q \"getUpdates FAILED\"; then\n    printf '%s\\n' \"$out\"; exit 0\n  fi\n  sleep 5   # backoff on error/empty so a blip can't hot-spin (429)\ndone\n"
+SEND_SH = "#!/usr/bin/env bash\n# send.sh \u2014 send one message.  Usage:  ./send.sh \"hello\"\nset -euo pipefail\n. \"$(dirname \"$0\")/config.sh\"\ncode=$(curl -s --max-time 30 -X POST \"https://api.telegram.org/bot${BOT_TOKEN}/sendMessage\" \\\n  --data-urlencode \"chat_id=${CHAT_ID}\" \\\n  --data-urlencode \"text=${1:-(empty)}\" \\\n  -o /dev/null -w \"%{http_code}\")\necho \"sendMessage -> HTTP ${code}\"\n[ \"${code}\" = \"200\" ] || exit 1\n"
+READ_SH = "#!/usr/bin/env bash\n# read.sh \u2014 print NEW human messages once, advance this bot's offset.\n#   ./read.sh           consume   |   ./read.sh --peek   look without advancing\n# Needs python3 (only for JSON parsing). POLL_NOW=1 ./read.sh returns immediately.\nset -euo pipefail\n. \"$(dirname \"$0\")/config.sh\"\nPEEK=\"${1:-}\"\nOFF=\"$(dirname \"$0\")/.offset_${BOT_NAME}\"\nTIMEOUT=$([ -n \"${POLL_NOW:-}\" ] && echo 0 || echo \"${POLL_SECS:-45}\")\nOFFSET=\"$(cat \"$OFF\" 2>/dev/null || echo \"\")\"\nQ=\"timeout=${TIMEOUT}&allowed_updates=%5B%22message%22%5D\"\n[ -n \"$OFFSET\" ] && Q=\"offset=${OFFSET}&${Q}\"\n# --max-time MUST exceed the long-poll timeout or curl aborts mid-poll\nRESP=\"$(curl -s --max-time $((TIMEOUT + 20)) \"https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?${Q}\" \\\n  || echo '{\"ok\":false,\"error\":\"curl failed\"}')\"\nprintf '%s' \"$RESP\" | CHAT_ID=\"$CHAT_ID\" BOT_ROLE=\"$BOT_ROLE\" OFF=\"$OFF\" PEEK=\"$PEEK\" python3 -c '\nimport sys, os, json\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    print(\"getUpdates FAILED: bad json\"); sys.exit(1)\nif not d.get(\"ok\"):\n    print(\"getUpdates FAILED:\", d.get(\"error\", d)); sys.exit(1)\nchat, role, off, peek = os.environ[\"CHAT_ID\"], os.environ[\"BOT_ROLE\"], os.environ[\"OFF\"], os.environ[\"PEEK\"]\nlast = None\nfor u in d.get(\"result\", []):\n    last = u[\"update_id\"]\n    m = u.get(\"message\") or {}\n    if str(m.get(\"chat\", {}).get(\"id\")) != chat: continue\n    f = m.get(\"from\", {})\n    if f.get(\"is_bot\"): continue\n    text = m.get(\"text\") or \"(non-text)\"\n    low = text.strip().lower()\n    to_dev = low.startswith(\"@anti\") or low.startswith(\"antigravity\")\n    to_all = low.startswith(\"@all\") or low.startswith(\"@both\")\n    if role == \"PM\" and to_dev and not to_all: continue\n    if role == \"DEV\" and not (to_dev or to_all): continue\n    print(\"%s: %s\" % (f.get(\"username\") or f.get(\"first_name\"), text))\nif peek != \"--peek\" and last is not None:\n    open(off, \"w\").write(str(last + 1))\n'\n"
+LISTEN_PS1 = "# listen.ps1 \u2014 block until a human message arrives, print it, then exit.\n# The AGENT runs this in the background; when it returns a line, the agent acts,\n# replies via send.ps1, and relaunches listen.ps1. Idle = a blocked HTTP call = ~0 tokens.\n. \"$PSScriptRoot\\config.ps1\"\n\n# Single-poller lock: two listeners on the SAME bot token = Telegram 409 Conflict =\n# dropped messages. Record our PID; if a previous live listener holds the lock, kill it\n# so exactly ONE poller survives (converges even if a stale one was left running).\n$lock = Join-Path $env:TEMP \"tg_listen_$BOT_NAME.lock\"\nif (Test-Path $lock) {\n    $old = (Get-Content $lock -Raw).Trim()\n    if ($old -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) {\n        Stop-Process -Id $old -Force -ErrorAction SilentlyContinue\n        Start-Sleep -Milliseconds 500\n    }\n}\n$PID | Set-Content $lock\n\ntry {\n    while ($true) {\n        $out = & \"$PSScriptRoot\\read.ps1\"\n        if ($out -and ($out -notmatch \"getUpdates FAILED\")) {\n            Write-Output $out\n            break\n        }\n        # backoff on error / empty so a network blip can't hot-spin (and trip 429)\n        Start-Sleep -Seconds 5\n    }\n} finally {\n    Remove-Item $lock -ErrorAction SilentlyContinue\n}\n"
+SEND_PS1 = "# send.ps1 \u2014 send one message to the group.  Usage:  .\\send.ps1 \"hello from the agent\"\n. \"$PSScriptRoot\\config.ps1\"\n$text = $args -join ' '\nif (-not $text) { $text = \"(empty)\" }\ntry {\n    Invoke-RestMethod -Method Post -TimeoutSec 30 `\n        -Uri \"https://api.telegram.org/bot$BOT_TOKEN/sendMessage\" `\n        -Body @{ chat_id = $CHAT_ID; text = $text } | Out-Null\n    Write-Host \"sent OK\"\n} catch {\n    Write-Host \"send FAILED: $($_.Exception.Message)\"\n    exit 1\n}\n"
+READ_PS1 = "# read.ps1 \u2014 print NEW human messages once, then advance this bot's read-offset.\n#   .\\read.ps1          consume (advance offset)\n#   .\\read.ps1 -Peek    look without advancing (safe for debugging)\n#   $env:POLL_NOW=1 ; .\\read.ps1   return immediately (timeout=0) instead of long-polling\nparam([switch]$Peek)\n. \"$PSScriptRoot\\config.ps1\"\n\n$offFile = Join-Path $PSScriptRoot \".offset_$BOT_NAME\"\n$timeout = if ($env:POLL_NOW) { 0 } else { $POLL_SECS }\n\n$offset = \"\"\nif (Test-Path $offFile) { $offset = (Get-Content $offFile -Raw).Trim() }\n\n$uri = \"https://api.telegram.org/bot$BOT_TOKEN/getUpdates?timeout=$timeout&allowed_updates=%5B%22message%22%5D\"\nif ($offset) { $uri = \"$uri&offset=$offset\" }\n\ntry {\n    # the HTTP timeout MUST be larger than the long-poll timeout or it aborts mid-poll\n    $resp = Invoke-RestMethod -Uri $uri -TimeoutSec ($timeout + 20)\n} catch {\n    Write-Output \"getUpdates FAILED: $($_.Exception.Message)\"\n    exit 1\n}\n\n$last = $null\nforeach ($u in $resp.result) {\n    $last = $u.update_id\n    $m = $u.message\n    if (-not $m) { continue }\n    if (\"$($m.chat.id)\" -ne \"$CHAT_ID\") { continue }   # only our group\n    if ($m.from.is_bot) { continue }                   # never read another bot (bots can't read bots)\n\n    $text = \"$($m.text)\"\n    if (-not $text) { $text = \"(non-text)\" }\n    $low   = $text.Trim().ToLower()\n    $toDev = $low.StartsWith(\"@anti\") -or $low.StartsWith(\"antigravity\")\n    $toAll = $low.StartsWith(\"@all\")  -or $low.StartsWith(\"@both\")\n\n    # routing: PM answers normal + @all ; DEV answers only @anti / @all\n    if ($BOT_ROLE -eq \"PM\"  -and $toDev -and -not $toAll) { continue }\n    if ($BOT_ROLE -eq \"DEV\" -and -not ($toDev -or $toAll)) { continue }\n\n    $who = $m.from.username\n    if (-not $who) { $who = $m.from.first_name }\n    Write-Output (\"{0}: {1}\" -f $who, $text)\n}\n\nif (-not $Peek -and $null -ne $last) {\n    Set-Content -Path $offFile -Value ([long]$last + 1)\n}\n"
 
 
-# ───────────────────────────── 1 group = Chat ID + nhiều bot ─────────────────────────────
-class GroupSection(ctk.CTkFrame):
-    def __init__(self, master, app, accent, data=None):
-        super().__init__(master, fg_color=THEME["surface"], corner_radius=16)
-        self.app = app
-        self.accent = accent
-        self.bots = []
-        data = data or {}
-        self.grid_columnconfigure(1, weight=1)
+# ───────────────────────────── Wizard Setup (cầu nối + thư viện persona) ─────────────────────────────
+# App KHÔNG gọi LLM. "Bộ não" là chính con Claude Code/Antigravity của user (đã login sẵn).
+# App chỉ: (1) ghi bộ kit Telegram (config + listen/send/read) cho agent xài,
+#          (2) lưu/gọi-lại PERSONA = sinh "prompt kích hoạt" để dán vào agent (như ACTIVATION-PROMPTS.md).
+from tkinter import filedialog
 
-        # spine màu (encode nhóm)
-        spine = ctk.CTkFrame(self, width=6, fg_color=accent, corner_radius=3)
-        spine.grid(row=0, column=0, padx=(10, 0), pady=14, sticky="ns")
+APP_NAME = "Telegram Remote Setup"
+PERSONA_FILE = DATA_DIR / "personas.json"
+DEFAULT_KIT_DIR = str(Path.home() / "telegram-remote-kit")
 
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.grid(row=0, column=1, padx=(12, 14), pady=12, sticky="ew")
-        content.grid_columnconfigure(0, weight=1)
-
-        # title bar: 📁 tên group + chip đếm + xoá group
-        tbar = ctk.CTkFrame(content, fg_color="transparent")
-        tbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        tbar.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(tbar, text="📁", font=F(16), width=22).grid(row=0, column=0)
-        self.group_name = ctk.CTkEntry(tbar, placeholder_text="Tên group (vd: Team Marketing)",
-                                       fg_color="transparent", border_width=0, text_color=THEME["text"],
-                                       placeholder_text_color=THEME["muted"], font=F(16, "bold"))
-        self.group_name.grid(row=0, column=1, padx=(2, 8), sticky="ew")
-        self.count_chip = ctk.CTkLabel(tbar, text="👥 0", fg_color=THEME["surface2"],
-                                       text_color=THEME["muted"], corner_radius=11, width=56, height=24,
-                                       font=F(11, "bold"))
-        self.count_chip.grid(row=0, column=2, padx=(0, 8))
-        ghost_button(tbar, "Xoá group", lambda: self.app._delete_group(self),
-                     width=96, danger=True, height=30).grid(row=0, column=3)
-
-        # chat bar
-        cbar = ctk.CTkFrame(content, fg_color="transparent")
-        cbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        cbar.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(cbar, text="🔗", font=F(14), width=22).grid(row=0, column=0)
-        self.chat = styled_entry(cbar, "Group Chat ID (-100… — nhập 1 lần, dùng chung cả group)")
-        self.chat.grid(row=0, column=1, sticky="ew")
-
-        # body bot rows
-        self.body = ctk.CTkFrame(content, fg_color="transparent")
-        self.body.grid(row=2, column=0, sticky="ew")
-        self.body.grid_columnconfigure(0, weight=1)
-
-        ghost_button(content, "➕ Thêm bot vào group", self.add_bot, width=190, height=34).grid(
-            row=3, column=0, pady=(8, 2), sticky="w")
-
-        BotRow._fill(self.group_name, data.get("group_name", ""))
-        BotRow._fill(self.chat, data.get("chat_id", ""))
-        for b in data.get("bots", []):
-            self.add_bot(b)
-        self._update_count()
-
-    def add_bot(self, data=None):
-        row = BotRow(self.body, self, self.accent, data if isinstance(data, dict) else None)
-        row.pack(fill="x", padx=0, pady=5)
-        self.bots.append(row)
-        self._update_count()
-        return row
-
-    def _delete_bot(self, row):
-        if row in self.bots:
-            self.bots.remove(row)
-        row.destroy()
-        self._update_count()
-
-    def _update_count(self):
-        self.count_chip.configure(text="👥 %d" % len(self.bots))
-
-    def to_dict(self):
-        return {
-            "chat_id": self.chat.get().strip(),
-            "group_name": self.group_name.get().strip(),
-            "bots": [b.to_dict() for b in self.bots],
-        }
+EMBEDDED = {
+    "listen.sh": LISTEN_SH, "send.sh": SEND_SH, "read.sh": READ_SH,
+    "listen.ps1": LISTEN_PS1, "send.ps1": SEND_PS1, "read.ps1": READ_PS1,
+}
 
 
-# ───────────────────────────── App ─────────────────────────────
-class ForgeApp(ctk.CTk):
+# ── ghi bộ kit ──
+def _config_sh(cfg):
+    return ('export BOT_TOKEN="%s"\n'
+            'export CHAT_ID="%s"\n'
+            'export BOT_NAME="%s"\n'
+            'export BOT_ROLE="%s"\n'
+            'export POLL_SECS="45"\n'
+            ) % (cfg["token"], cfg["chat_id"], cfg["bot_name"] or "agent", cfg["role"])
+
+
+def _config_ps1(cfg):
+    return ('$BOT_TOKEN = "%s"\n'
+            '$CHAT_ID   = "%s"\n'
+            '$BOT_NAME  = "%s"\n'
+            '$BOT_ROLE  = "%s"\n'
+            '$POLL_SECS = 45\n'
+            ) % (cfg["token"], cfg["chat_id"], cfg["bot_name"] or "agent", cfg["role"])
+
+
+def write_kit(folder, cfg):
+    p = Path(folder)
+    p.mkdir(parents=True, exist_ok=True)
+    files = dict(EMBEDDED)
+    files["config.sh"] = _config_sh(cfg)
+    files["config.ps1"] = _config_ps1(cfg)
+    for name, content in files.items():
+        fp = p / name
+        fp.write_text(content)
+        if name.endswith(".sh"):
+            try:
+                fp.chmod(0o755)
+            except Exception:
+                pass
+    return p
+
+
+# ── Telegram 1-shot (KHÔNG long-poll, chỉ để dò chat id + test gửi) ──
+def detect_chat_id(token):
+    data = tg_get_updates(token, None, 0)
+    if not data.get("ok", False):
+        raise RuntimeError(data.get("description", "getUpdates lỗi (token sai? webhook chưa xoá?)"))
+    results = data.get("result", [])
+    for u in reversed(results):                       # ưu tiên group/supergroup, tin mới nhất
+        chat = (u.get("message") or {}).get("chat") or {}
+        if chat.get("type") in ("group", "supergroup"):
+            return str(chat.get("id")), chat.get("title") or ""
+    for u in reversed(results):                       # fallback: bất kỳ chat nào
+        chat = (u.get("message") or {}).get("chat") or {}
+        if chat.get("id") is not None:
+            return str(chat.get("id")), chat.get("title") or chat.get("first_name") or ""
+    return None, ""
+
+
+# ── sinh "prompt kích hoạt" (gọi lại persona) — mô phỏng ACTIVATION-PROMPTS.md ──
+def activation_prompt(persona, kit_dir, cfg):
+    name = persona.get("name") or "Trợ lý"
+    body = (persona.get("persona") or "").strip()
+    role = (cfg.get("role") or "PM").upper()
+    route = ("Routing: mày là PM — trả lời MỌI tin của chủ (trừ tin mở đầu @anti)."
+             if role == "PM" else
+             "Routing: mày là DEV — CHỈ trả lời tin mở đầu bằng @anti hoặc @all.")
+    kit = kit_dir or DEFAULT_KIT_DIR
+    return (
+        "Mày là %s.\n%s\n\n"
+        "Mày được CHỦ điều khiển từ xa qua Telegram 2 chiều. Bộ kit đã ghi sẵn ở:\n"
+        "  %s\n"
+        "(config token + chat id đã có sẵn trong đó — KHÔNG cần sửa.)\n\n"
+        "VẬN HÀNH VÒNG LẶP (bắt buộc):\n"
+        "1. VIỆC ĐẦU TIÊN: chạy `%s/listen.sh` ở NỀN (harness-tracked background, TUYỆT ĐỐI không dùng `&`).\n"
+        "   Nó block tới khi có tin của chủ rồi in ra — idle ~0 token (chỉ là curl chờ Telegram).\n"
+        "2. Khi listen trả về 1 tin: TRƯỚC TIÊN ACK \"đã nhận: …\" qua `%s/send.sh \"…\"` để chủ biết mày sống.\n"
+        "3. RỒI mới làm việc chủ yêu cầu, trả KẾT QUẢ qua `%s/send.sh \"…\"`.\n"
+        "4. Xong thì RELAUNCH listen (lặp bước 1). KHÔNG chạy 2 listen cùng lúc (Telegram 409).\n"
+        "%s\n"
+        "Mày đọc được tin của CHỦ, KHÔNG đọc được bot khác.\n"
+        "(Windows: dùng listen.ps1 / send.ps1 thay cho .sh.)"
+        % (name, body, kit, kit, kit, kit, route)
+    )
+
+
+# ── thư viện persona ──
+def preset_catalog():
+    cat = {}
+    for team, chars in PRESETS.items():
+        for c in chars:
+            cat["%s · %s" % (team, c["role"])] = {
+                "name": c["role"], "role": c["role"], "persona": c["system_prompt"]}
+    return cat
+
+
+DEFAULT_PERSONA = {
+    "name": "Trợ lý điều phối", "role": "pm",
+    "persona": _p("Trợ lý / PM điều phối từ xa",
+                  "điềm tĩnh, rõ ràng, chủ động",
+                  "báo cáo gọn, hỏi lại khi thiếu thông tin",
+                  "thân thiện, dứt khoát",
+                  "nhận lệnh qua Telegram, làm việc, báo kết quả"),
+}
+
+
+def load_personas():
+    try:
+        data = json.loads(PERSONA_FILE.read_text())
+        if isinstance(data, list) and data:
+            return data
+    except Exception:
+        pass
+    return [dict(DEFAULT_PERSONA)]
+
+
+def save_personas(lst):
+    try:
+        PERSONA_FILE.write_text(json.dumps(lst, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+# ── trạng thái kết nối ──
+import tempfile
+
+
+def tg_get_me(token):
+    return _http_json("https://api.telegram.org/bot%s/getMe" % token, method="GET", timeout=15)
+
+
+def listener_status(bot_name):
+    # Agent chạy listen.sh -> đẻ lock tg_listen_<BOT_NAME>.lock ở temp. Đọc lock = biết
+    # listener của agent có đang chạy không (LOCAL, không poll Telegram -> khỏi đụng 409).
+    lock = Path(tempfile.gettempdir()) / ("tg_listen_%s.lock" % (bot_name or "agent"))
+    if not lock.exists():
+        return False
+    try:
+        return _pid_alive(int(lock.read_text().strip()))
+    except Exception:
+        return False
+
+
+# ───────────────────────────── App (Wizard) ─────────────────────────────
+class WizardApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-
         self.title(APP_NAME)
-        self.geometry("780x1000")
-        self.minsize(680, 820)
+        self.geometry("900x980")
+        self.minsize(820, 820)
         self.configure(fg_color=THEME["bg"])
 
-        self.groups = []
-        self.workers = []
+        self.personas = load_personas()
+        self.cur = 0
+        self.catalog = preset_catalog()
         self.log_queue = queue.Queue()
 
         self._build_ui()
-        self._load_settings()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(150, self._drain_log_queue)
+        self._load_persona(0)
+        self.after(150, self._drain_log)
 
+    # ---------- UI ----------
     def _build_ui(self):
         ctk.set_appearance_mode("dark")
-
         self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
-        # ── header: tên app + subtitle + status pill ──
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, padx=20, pady=(18, 6), sticky="ew")
-        header.grid_columnconfigure(0, weight=1)
-        titlecol = ctk.CTkFrame(header, fg_color="transparent")
-        titlecol.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(titlecol, text=APP_NAME, font=F(25, "bold"), text_color=THEME["text"]).pack(anchor="w")
-        ctk.CTkLabel(titlecol, text="Bảng điều khiển đội bot Telegram — nhiều bot AI, nhiều group, mỗi bot một nhân cách",
+        # header
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, columnspan=2, padx=22, pady=(18, 8), sticky="ew")
+        ctk.CTkLabel(head, text=APP_NAME, font=F(25, "bold"), text_color=THEME["text"]).pack(anchor="w")
+        ctk.CTkLabel(head, text="Cho bạn bè điều khiển agent Claude của họ qua Telegram — KHÔNG cần API key, không tốn token.",
                      font=F(12), text_color=THEME["muted"]).pack(anchor="w")
-        self.status_pill = ctk.CTkLabel(header, text="●  Đã dừng", fg_color=THEME["surface2"],
-                                        text_color=THEME["muted"], corner_radius=15, width=132, height=32,
-                                        font=F(12, "bold"))
-        self.status_pill.grid(row=0, column=1, sticky="e")
 
-        # ── toolbar: preset + nạp + group trống ──
-        ctrl = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=14)
-        ctrl.grid(row=1, column=0, padx=20, pady=6, sticky="ew")
-        ctk.CTkLabel(ctrl, text="Preset team", font=F(12, "bold"), text_color=THEME["muted"]).grid(
-            row=0, column=0, padx=(14, 8), pady=12)
-        self.preset_var = ctk.StringVar(value=list(PRESETS)[0])
-        styled_menu(ctrl, list(PRESETS), self.preset_var, width=210).grid(row=0, column=1, padx=(0, 10), pady=12)
-        accent_button(ctrl, "📦 Nạp team", self._on_load_preset, width=150).grid(row=0, column=2, padx=4, pady=12)
-        ghost_button(ctrl, "➕ Group trống", self._on_add_group, width=140).grid(row=0, column=3, padx=4, pady=12)
+        self._build_status()
+        self._build_connect(self._card(2, 0, "1 · KẾT NỐI TELEGRAM"))
+        self._build_persona(self._card(2, 1, "2 · PERSONA (lưu / gọi lại)"))
+        self._build_output()
+        self._build_log()
+        self.after(400, self._on_check_status)
 
-        # ── eyebrow ──
-        ctk.CTkLabel(self, text="ĐỘI HÌNH BOT", font=F(11, "bold"), text_color=THEME["muted"]).grid(
-            row=2, column=0, padx=22, pady=(8, 0), sticky="w")
+    def _card(self, row, col, title):
+        c = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=16)
+        c.grid(row=row, column=col, padx=(20 if col == 0 else 10, 20 if col == 1 else 10),
+               pady=8, sticky="nsew")
+        c.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(c, text=title, font=F(12, "bold"), text_color=THEME["accent"]).grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+        body = ctk.CTkFrame(c, fg_color="transparent")
+        body.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        return body
 
-        # ── roster cuộn ──
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color=THEME["bg"],
-                                             scrollbar_button_color=THEME["surface2"],
-                                             scrollbar_button_hover_color=THEME["border"])
-        self.scroll.grid(row=3, column=0, padx=18, pady=(2, 4), sticky="nsew")
-        self.scroll.grid_columnconfigure(0, weight=1)
-        # Tk9/macOS: CTk không cuộn được bằng wheel -> bind TOÀN CỤC, event nào không bị
-        # widget nuốt đều nổi lên đây -> cuộn canvas của roster.
-        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.bind_all(_seq, self._on_mousewheel, add="+")
+    def _build_connect(self, b):
+        self.token_e = styled_entry(b, "Bot Token (từ @BotFather)")
+        self.token_e.grid(row=0, column=0, pady=5, sticky="ew")
 
-        # ── footer: skip + start/stop ──
-        foot = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=14)
-        foot.grid(row=4, column=0, padx=20, pady=(4, 6), sticky="ew")
-        foot.grid_columnconfigure(2, weight=1)
-        self.skip_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(foot, text="Bỏ qua tin cũ khi khởi động", variable=self.skip_var,
-                      progress_color=THEME["accent"], text_color=THEME["muted"], font=F(12)).grid(
-            row=0, column=0, padx=(14, 16), pady=12, sticky="w")
-        self.start_btn = accent_button(foot, "▶  Khởi động", self._on_start, width=150)
-        self.start_btn.grid(row=0, column=3, padx=6, pady=12)
-        self.stop_btn = ghost_button(foot, "■  Dừng", self._on_stop, width=120, danger=True)
-        self.stop_btn.configure(state="disabled")
-        self.stop_btn.grid(row=0, column=4, padx=(0, 14), pady=12)
+        rowf = ctk.CTkFrame(b, fg_color="transparent")
+        rowf.grid(row=1, column=0, pady=5, sticky="ew")
+        rowf.grid_columnconfigure(1, weight=1)
+        ghost_button(rowf, "🔎 Lấy Chat ID", self._on_get_chatid, width=130, height=32).grid(row=0, column=0, padx=(0, 8))
+        self.chat_e = styled_entry(rowf, "Group Chat ID (-100…)")
+        self.chat_e.grid(row=0, column=1, sticky="ew")
 
-        # ── log ──
-        ctk.CTkLabel(self, text="NHẬT KÝ", font=F(11, "bold"), text_color=THEME["muted"]).grid(
-            row=5, column=0, padx=22, pady=(2, 0), sticky="w")
-        self.log_box = ctk.CTkTextbox(self, height=140, fg_color=THEME["surface"],
-                                      text_color=THEME["muted"], border_width=0, corner_radius=12,
-                                      font=(_MONO, 11))
-        self.log_box.grid(row=6, column=0, padx=20, pady=(2, 16), sticky="ew")
+        rowf2 = ctk.CTkFrame(b, fg_color="transparent")
+        rowf2.grid(row=2, column=0, pady=5, sticky="ew")
+        rowf2.grid_columnconfigure(0, weight=1)
+        self.name_e = styled_entry(rowf2, "Tên agent (vd: trợ lý của Tèo)")
+        self.name_e.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.role_v = ctk.StringVar(value="PM")
+        styled_menu(rowf2, ["PM", "DEV"], self.role_v, width=86).grid(row=0, column=1, sticky="e")
+
+        rowf3 = ctk.CTkFrame(b, fg_color="transparent")
+        rowf3.grid(row=3, column=0, pady=5, sticky="ew")
+        rowf3.grid_columnconfigure(0, weight=1)
+        self.kit_e = styled_entry(rowf3, "Thư mục ghi bộ kit")
+        self.kit_e.insert(0, DEFAULT_KIT_DIR)
+        self.kit_e.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        ghost_button(rowf3, "📁", self._on_pick_folder, width=44, height=32).grid(row=0, column=1)
+
+        rowf4 = ctk.CTkFrame(b, fg_color="transparent")
+        rowf4.grid(row=4, column=0, pady=(8, 0), sticky="ew")
+        accent_button(rowf4, "💾 Ghi bộ kit", self._on_write_kit, width=140).grid(row=0, column=0, padx=(0, 8))
+        ghost_button(rowf4, "✈️ Test gửi", self._on_test_send, width=120).grid(row=0, column=1)
+
+    def _build_persona(self, b):
+        rowf = ctk.CTkFrame(b, fg_color="transparent")
+        rowf.grid(row=0, column=0, pady=5, sticky="ew")
+        rowf.grid_columnconfigure(0, weight=1)
+        self.persona_v = ctk.StringVar(value="")
+        self.persona_menu = ctk.CTkOptionMenu(rowf, values=["—"], variable=self.persona_v,
+                                              command=self._on_persona_select, width=180, height=30,
+                                              fg_color=THEME["surface2"], button_color=THEME["accent"],
+                                              button_hover_color=THEME["accent_hover"], text_color=THEME["text"],
+                                              dropdown_fg_color=THEME["surface2"], dropdown_text_color=THEME["text"],
+                                              dropdown_hover_color=THEME["surface"], corner_radius=8, font=F(12))
+        self.persona_menu.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        ghost_button(rowf, "🆕", self._on_new_persona, width=40, height=30).grid(row=0, column=1, padx=2)
+        ghost_button(rowf, "🗑", self._on_del_persona, width=40, height=30, danger=True).grid(row=0, column=2, padx=2)
+
+        rowf2 = ctk.CTkFrame(b, fg_color="transparent")
+        rowf2.grid(row=1, column=0, pady=5, sticky="ew")
+        rowf2.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(rowf2, text="Nạp preset:", font=F(11), text_color=THEME["muted"]).grid(row=0, column=0, padx=(0, 6))
+        self.preset_v = ctk.StringVar(value=list(self.catalog)[0])
+        styled_menu(rowf2, list(self.catalog), self.preset_v, width=160).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ghost_button(rowf2, "📦 Nạp", self._on_load_preset, width=72, height=30).grid(row=0, column=2)
+
+        rowf3 = ctk.CTkFrame(b, fg_color="transparent")
+        rowf3.grid(row=2, column=0, pady=5, sticky="ew")
+        rowf3.grid_columnconfigure(0, weight=1)
+        self.pname_e = styled_entry(rowf3, "Tên persona")
+        self.pname_e.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.prole_e = styled_entry(rowf3, "@tag (vd: pm)")
+        self.prole_e.grid(row=0, column=1, sticky="e")
+        self.prole_e.configure(width=110)
+
+        self.pbox = ctk.CTkTextbox(b, height=150, fg_color=THEME["bg"], text_color=THEME["text"],
+                                   border_color=THEME["border"], border_width=1, corner_radius=8, font=F(13))
+        self.pbox.grid(row=3, column=0, pady=5, sticky="ew")
+
+        accent_button(b, "💾 Lưu persona", self._on_save_persona, width=150).grid(row=4, column=0, pady=(6, 0), sticky="w")
+
+        self._refresh_persona_menu()
+
+    def _build_output(self):
+        card = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=16)
+        card.grid(row=3, column=0, columnspan=2, padx=20, pady=8, sticky="nsew")
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(2, weight=1)
+        bar = ctk.CTkFrame(card, fg_color="transparent")
+        bar.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
+        bar.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(bar, text="3 · PROMPT KÍCH HOẠT — dán vào Claude Code / Antigravity của bạn ấy",
+                     font=F(12, "bold"), text_color=THEME["accent"]).grid(row=0, column=0, sticky="w")
+        accent_button(bar, "📋 Tạo & Copy", self._on_gen_prompt, width=150).grid(row=0, column=1, sticky="e")
+        self.out = ctk.CTkTextbox(card, fg_color=THEME["bg"], text_color=THEME["text"],
+                                  border_color=THEME["border"], border_width=1, corner_radius=8, font=(_MONO, 12))
+        self.out.grid(row=2, column=0, padx=16, pady=(2, 14), sticky="nsew")
+
+    def _build_log(self):
+        self.log_box = ctk.CTkTextbox(self, height=92, fg_color=THEME["surface"], text_color=THEME["muted"],
+                                      border_width=0, corner_radius=12, font=(_MONO, 11))
+        self.log_box.grid(row=4, column=0, columnspan=2, padx=20, pady=(0, 14), sticky="ew")
         self.log_box.configure(state="disabled")
-        # lăn trên log cũng cuộn roster (nhất quán, khỏi nhảy 2 vùng)
-        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.log_box._textbox.bind(_seq, self._on_mousewheel)
 
-    # ---- status pill ----
-    def _set_status(self, text, running):
-        self.status_pill.configure(
-            text=text,
-            fg_color=THEME["success"] if running else THEME["surface2"],
-            text_color="#0F1117" if running else THEME["muted"])
+    # ---------- trạng thái kết nối ----------
+    def _build_status(self):
+        bar = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=14)
+        bar.grid(row=1, column=0, columnspan=2, padx=20, pady=(2, 6), sticky="ew")
+        bar.grid_columnconfigure(3, weight=1)
+        self.tg_pill = ctk.CTkLabel(bar, text="Telegram: ⚪ chưa kiểm tra", fg_color=THEME["surface2"],
+                                    text_color=THEME["muted"], corner_radius=12, height=30, font=F(12, "bold"))
+        self.tg_pill.grid(row=0, column=0, padx=(14, 8), pady=10)
+        self.brain_pill = ctk.CTkLabel(bar, text="Bộ não: ⚪ chưa chạy", fg_color=THEME["surface2"],
+                                       text_color=THEME["muted"], corner_radius=12, height=30, font=F(12, "bold"))
+        self.brain_pill.grid(row=0, column=1, padx=8, pady=10)
+        ghost_button(bar, "🔄 Kiểm tra", self._on_check_status, width=120, height=30).grid(row=0, column=2, padx=8)
+        ctk.CTkLabel(bar, text="(Bộ não = listener của agent đang chạy trên máy này)",
+                     font=F(11), text_color=THEME["muted"]).grid(row=0, column=3, padx=(4, 14), sticky="e")
 
-    # ---- mousewheel (Tk9 / macOS) — bind toàn cục, cuộn canvas của roster ----
-    def _on_mousewheel(self, event):
-        cv = getattr(self.scroll, "_parent_canvas", None)
-        if cv is None:
+    def _set_pill(self, pill, text, state):
+        col = {"ok": THEME["success"], "bad": THEME["danger"], "idle": THEME["surface2"]}[state]
+        fg = "#0F1117" if state == "ok" else ("#FFFFFF" if state == "bad" else THEME["muted"])
+        pill.configure(text=text, fg_color=col, text_color=fg)
+
+    def _on_check_status(self):
+        # Bộ não: kiểm lock listener (LOCAL, không đụng Telegram -> khỏi 409)
+        if listener_status(self.name_e.get().strip() or "agent"):
+            self._set_pill(self.brain_pill, "Bộ não: 🟢 đang lắng nghe", "ok")
+        else:
+            self._set_pill(self.brain_pill, "Bộ não: ⚪ chưa chạy", "idle")
+        # Telegram: getMe (chạy nền, không conflict getUpdates)
+        token = self.token_e.get().strip()
+        if not token or ":" not in token:
+            self._set_pill(self.tg_pill, "Telegram: ⚪ chưa có token", "idle")
             return
-        num = getattr(event, "num", 0)
-        delta = getattr(event, "delta", 0)
-        if num == 4 or delta > 0:
-            cv.yview_scroll(-3, "units")
-        elif num == 5 or delta < 0:
-            cv.yview_scroll(3, "units")
-        return "break"
+        self._set_pill(self.tg_pill, "Telegram: ⏳ đang kiểm…", "idle")
 
-    # ---- log ----
-    def _drain_log_queue(self):
+        def work():
+            try:
+                me = tg_get_me(token)
+                if me.get("ok"):
+                    uname = (me.get("result") or {}).get("username") or "?"
+                    self.after(0, lambda: self._set_pill(self.tg_pill, "Telegram: 🟢 @%s" % uname, "ok"))
+                else:
+                    self.after(0, lambda: self._set_pill(self.tg_pill, "Telegram: 🔴 token sai", "bad"))
+            except Exception:
+                self.after(0, lambda: self._set_pill(self.tg_pill, "Telegram: 🔴 lỗi mạng", "bad"))
+        self._bg(work)
+
+    # ---------- log ----------
+    def _drain_log(self):
         try:
             while True:
                 line = self.log_queue.get_nowait()
-                self._append_log("[%s] %s" % (time.strftime("%H:%M:%S"), line))
+                self.log_box.configure(state="normal")
+                self.log_box.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), line))
+                self.log_box.see("end")
+                self.log_box.configure(state="disabled")
         except queue.Empty:
             pass
-        self.after(150, self._drain_log_queue)
+        self.after(150, self._drain_log)
 
-    def _append_log(self, line):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", line + "\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+    def log(self, msg):
+        self.log_queue.put(msg)
 
-    # ---- group ----
-    def _add_group(self, data=None):
-        accent = GROUP_ACCENTS[len(self.groups) % len(GROUP_ACCENTS)]
-        g = GroupSection(self.scroll, self, accent, data)
-        g.pack(fill="x", padx=4, pady=8)
-        self.groups.append(g)
-        return g
+    def _bg(self, fn, *a):
+        threading.Thread(target=fn, args=a, daemon=True).start()
 
-    def _delete_group(self, group):
-        if group in self.groups:
-            self.groups.remove(group)
-        group.destroy()
+    # ---------- connection ----------
+    def _cfg(self):
+        return {"token": self.token_e.get().strip(), "chat_id": self.chat_e.get().strip(),
+                "bot_name": self.name_e.get().strip(), "role": self.role_v.get()}
 
-    def _on_add_group(self):
-        self._add_group({"group_name": "", "chat_id": "", "bots": [{"is_default": True}]})
+    def _on_get_chatid(self):
+        token = self.token_e.get().strip()
+        if not token or ":" not in token:
+            self.log("❌ Nhập Bot Token trước (dạng 123456:ABC…).")
+            return
+        self.log("🔎 Đang dò Chat ID… (nhớ nhắn 1 câu vào group + bot là admin).")
+
+        def work():
+            try:
+                cid, title = detect_chat_id(token)
+                if cid:
+                    self.after(0, lambda: (self.chat_e.delete(0, "end"), self.chat_e.insert(0, cid)))
+                    self.log("✅ Chat ID = %s%s" % (cid, (" (%s)" % title if title else "")))
+                else:
+                    self.log("⚠ Chưa thấy tin nào — nhắn 1 câu vào group rồi bấm lại.")
+            except Exception as e:
+                self.log("❌ Lỗi dò Chat ID: %s" % e)
+        self._bg(work)
+
+    def _on_pick_folder(self):
+        d = filedialog.askdirectory(initialdir=self.kit_e.get().strip() or str(Path.home()))
+        if d:
+            self.kit_e.delete(0, "end")
+            self.kit_e.insert(0, d)
+
+    def _on_write_kit(self):
+        cfg = self._cfg()
+        if not cfg["token"] or ":" not in cfg["token"]:
+            self.log("❌ Thiếu Bot Token hợp lệ.")
+            return
+        if not cfg["chat_id"]:
+            self.log("❌ Thiếu Chat ID (bấm 🔎 để lấy).")
+            return
+        folder = self.kit_e.get().strip() or DEFAULT_KIT_DIR
+        try:
+            p = write_kit(folder, cfg)
+            self.log("💾 Đã ghi bộ kit vào: %s (config + listen/send/read .sh & .ps1)" % p)
+        except Exception as e:
+            self.log("❌ Ghi kit lỗi: %s" % e)
+
+    def _on_test_send(self):
+        cfg = self._cfg()
+        if not cfg["token"] or not cfg["chat_id"]:
+            self.log("❌ Cần Token + Chat ID để test.")
+            return
+        self.log("✈️ Đang gửi tin test…")
+
+        def work():
+            try:
+                r = tg_send_message(cfg["token"], cfg["chat_id"],
+                                    "✅ Test từ Telegram Remote Setup — bot nói được vào group rồi.")
+                self.log("✅ Gửi OK." if r.get("ok") else "⚠ Telegram trả: %s" % r)
+            except Exception as e:
+                self.log("❌ Gửi lỗi: %s" % e)
+        self._bg(work)
+
+    # ---------- persona ----------
+    def _refresh_persona_menu(self):
+        labels = ["%d. %s" % (i + 1, p.get("name") or "(chưa đặt tên)") for i, p in enumerate(self.personas)]
+        self.persona_menu.configure(values=labels)
+        if labels:
+            self.persona_menu.set(labels[self.cur])
+
+    def _commit_persona(self):
+        if 0 <= self.cur < len(self.personas):
+            self.personas[self.cur] = {
+                "name": self.pname_e.get().strip(),
+                "role": self.prole_e.get().strip(),
+                "persona": self.pbox.get("1.0", "end").strip(),
+            }
+
+    def _load_persona(self, i):
+        p = self.personas[i]
+        self.pname_e.delete(0, "end")
+        if p.get("name"):
+            self.pname_e.insert(0, p["name"])
+        self.prole_e.delete(0, "end")
+        if p.get("role"):
+            self.prole_e.insert(0, p["role"])
+        self.pbox.delete("1.0", "end")
+        if p.get("persona"):
+            self.pbox.insert("1.0", p["persona"])
+
+    def _on_persona_select(self, label):
+        self._commit_persona()
+        try:
+            idx = int(label.split(".")[0]) - 1
+        except Exception:
+            idx = 0
+        self.cur = max(0, min(idx, len(self.personas) - 1))
+        self._load_persona(self.cur)
+        self._refresh_persona_menu()
+
+    def _on_new_persona(self):
+        self._commit_persona()
+        self.personas.append({"name": "Persona mới", "role": "", "persona": ""})
+        self.cur = len(self.personas) - 1
+        self._load_persona(self.cur)
+        self._refresh_persona_menu()
+
+    def _on_del_persona(self):
+        if len(self.personas) <= 1:
+            self.log("⚠ Phải còn ít nhất 1 persona.")
+            return
+        del self.personas[self.cur]
+        self.cur = max(0, self.cur - 1)
+        self._load_persona(self.cur)
+        self._refresh_persona_menu()
+        save_personas(self.personas)
 
     def _on_load_preset(self):
-        theme = self.preset_var.get()
-        chars = PRESETS.get(theme, [])
-        self._add_group({"group_name": theme, "chat_id": "", "bots": [dict(c) for c in chars]})
-        self.log_queue.put("📦 Nạp team \"%s\" thành 1 group: %d bot — điền Chat ID 1 lần + Token/API Key từng bot."
-                           % (theme, len(chars)))
+        c = self.catalog.get(self.preset_v.get())
+        if not c:
+            return
+        self.pname_e.delete(0, "end"); self.pname_e.insert(0, c["name"])
+        self.prole_e.delete(0, "end"); self.prole_e.insert(0, c["role"])
+        self.pbox.delete("1.0", "end"); self.pbox.insert("1.0", c["persona"])
+        self.log("📦 Đã nạp preset \"%s\" vào ô soạn — sửa rồi bấm 💾 Lưu persona." % self.preset_v.get())
 
-    # ---- settings ----
-    def _save_settings(self):
-        try:
-            SETTINGS_FILE.write_text(json.dumps(
-                {"groups": [g.to_dict() for g in self.groups], "skip_backlog": bool(self.skip_var.get())},
-                ensure_ascii=False, indent=2))
-        except Exception as e:
-            self.log_queue.put("⚠ Không lưu được cấu hình: %s" % e)
+    def _on_save_persona(self):
+        self._commit_persona()
+        save_personas(self.personas)
+        self._refresh_persona_menu()
+        self.log("💾 Đã lưu persona \"%s\"." % (self.personas[self.cur].get("name") or "?"))
 
-    def _load_settings(self):
-        data = {}
+    # ---------- generate ----------
+    def _on_gen_prompt(self):
+        self._commit_persona()
+        save_personas(self.personas)
+        cfg = self._cfg()
+        kit = self.kit_e.get().strip() or DEFAULT_KIT_DIR
+        text = activation_prompt(self.personas[self.cur], kit, cfg)
+        self.out.delete("1.0", "end")
+        self.out.insert("1.0", text)
         try:
-            data = json.loads(SETTINGS_FILE.read_text())
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.log("📋 Đã tạo + COPY prompt kích hoạt — dán thẳng vào Claude Code của bạn ấy.")
         except Exception:
-            data = {}
-        groups = []
-        if isinstance(data, dict) and data.get("groups"):
-            groups = data["groups"]
-        elif isinstance(data, dict) and (data.get("bots") or data.get("token")):
-            flat = data.get("bots") or [data]
-            buckets, order = {}, []
-            for b in flat:
-                key = (b.get("chat_id", ""), b.get("group_name", ""))
-                if key not in buckets:
-                    buckets[key] = {"chat_id": b.get("chat_id", ""),
-                                    "group_name": b.get("group_name", ""), "bots": []}
-                    order.append(key)
-                buckets[key]["bots"].append({
-                    "token": b.get("token", ""), "provider": b.get("provider", "Claude"),
-                    "api_key": b.get("api_key", ""), "role": b.get("role", ""),
-                    "is_default": b.get("is_default", True), "system_prompt": b.get("system_prompt", ""),
-                })
-            groups = [buckets[k] for k in order]
-        if not groups:
-            groups = [{"group_name": "", "chat_id": "", "bots": [{"is_default": True}]}]
-        for g in groups:
-            self._add_group(g)
-        if isinstance(data, dict):
-            self.skip_var.set(bool(data.get("skip_backlog", True)))
-
-    # ---- Start / Stop ----
-    def _on_start(self):
-        if not self.groups:
-            self.log_queue.put("⚠ Chưa có group nào — bấm ➕ Group trống hoặc 📦 Nạp team.")
-            return
-        entries, errs = [], []
-        for gi, g in enumerate(self.groups):
-            gd = g.to_dict()
-            chat, gname = gd["chat_id"], gd["group_name"]
-            tag_g = "Group #%d (%s)" % (gi + 1, gname or "?")
-            if not chat:
-                errs.append("%s: thiếu Group Chat ID." % tag_g)
-            if not gd["bots"]:
-                errs.append("%s: chưa có bot nào." % tag_g)
-            for bi, b in enumerate(gd["bots"]):
-                lbl = "%s / bot #%d (%s)" % (tag_g, bi + 1, b["role"] or "?")
-                if not b["token"] or ":" not in b["token"]:
-                    errs.append("%s: Bot Token trống/sai (123456:ABC…)." % lbl)
-                if not b["api_key"]:
-                    errs.append("%s: API Key trống." % lbl)
-                if not b["is_default"] and not b["role"]:
-                    errs.append("%s: bot không 'mặc định' phải có Role/@tag." % lbl)
-                entries.append({
-                    "token": b["token"], "chat_id": chat, "group_name": gname,
-                    "provider": b["provider"], "api_key": b["api_key"], "role": b["role"],
-                    "is_default": b["is_default"], "system_prompt": b["system_prompt"],
-                })
-        if errs:
-            for e in errs:
-                self.log_queue.put("❌ " + e)
-            return
-        self._save_settings()
-
-        by_token = {}
-        for e in entries:
-            by_token.setdefault(e["token"], []).append(e)
-        self.workers = []
-        for token, ents in by_token.items():
-            w = TokenWorker(token, ents, self.log_queue.put, bool(self.skip_var.get()))
-            w.start()
-            self.workers.append(w)
-
-        self.log_queue.put("▶️ Khởi động %d bot / %d group / %d token."
-                           % (len(entries), len(self.groups), len(by_token)))
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self._set_status("●  Đang chạy · %d bot" % len(entries), True)
-
-    def _on_stop(self):
-        for w in self.workers:
-            w.stop_event.set()
-        self.stop_btn.configure(state="disabled")
-        self._set_status("●  Đang dừng…", False)
-        self.after(300, self._check_stopped)
-
-    def _check_stopped(self):
-        if any(w.is_alive() for w in self.workers):
-            self.after(300, self._check_stopped)
-            return
-        self.workers = []
-        self.start_btn.configure(state="normal")
-        self._set_status("●  Đã dừng", False)
-
-    def _on_close(self):
-        for w in self.workers:
-            w.stop_event.set()
-        self.destroy()
+            self.log("📋 Đã tạo prompt (copy tay từ ô bên trên nếu clipboard lỗi).")
 
 
 if __name__ == "__main__":
-    ForgeApp().mainloop()
+    WizardApp().mainloop()

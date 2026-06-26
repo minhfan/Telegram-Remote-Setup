@@ -1,6 +1,2 @@
-# Lò Rèn Chronos — Desktop App
-# Chạy app (Mac/Win/Linux) chỉ cần CustomTkinter; HTTP + GUI còn lại dùng stdlib (urllib, tkinter).
+# Telegram Remote Setup — chỉ cần CustomTkinter (HTTP + script kit nhúng sẵn, dùng stdlib).
 customtkinter>=5.2.2
-
-# Chỉ cần khi ĐÓNG GÓI .exe trên Windows (GitHub Actions tự cài, không bắt buộc local):
-# pyinstaller>=6.0
