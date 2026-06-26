@@ -2,80 +2,82 @@
 
 > 🇻🇳 Bản tiếng Việt ở trên. &nbsp;&nbsp; 🇬🇧 **English version below ⬇**
 
-Wizard desktop nhỏ gọn giúp bạn **điều khiển agent AI lập trình của mình (Claude Code / Antigravity) từ điện thoại qua Telegram**. Agent chính là "bộ não" (dùng đăng nhập sẵn của nó) — nên **KHÔNG cần API key, không tốn token khi rảnh**.
+Wizard desktop giúp **điều khiển nhiều agent AI lập trình (Claude Code / Codex / Gemini CLI…) từ điện thoại qua Telegram**, và cho **các bot nói chuyện với nhau** qua một kênh file trung gian. Mỗi agent là "bộ não" (dùng đăng nhập sẵn của nó) — nên **KHÔNG cần API key, không tốn token khi rảnh**.
 
 ---
 
 ## 1. Cái này là gì
 
-App **không tự gọi LLM**. Nó chỉ làm 2 việc:
+App **không tự gọi LLM**. Nó làm 3 việc:
 
-1. **Ghi bộ kit Telegram** (config + script `listen`/`send`/`read`) để agent của bạn dùng làm "đường ống" nói chuyện với Telegram.
-2. **Lưu & gọi lại Persona** — sinh ra một "prompt kích hoạt" để bạn dán vào agent; agent đọc xong sẽ vận hành vòng lặp Telegram theo đúng nhân cách đó.
+1. **Ghi bộ kit Telegram RIÊNG cho từng bot** (config + `listen`/`send`/`read`) — mỗi bot tên duy nhất → folder/lock/offset riêng → **nhiều bot không đè nhau**.
+2. **Dựng kênh trung gian "team"** để **bot ↔ bot** (vì Telegram, bot không đọc được tin của bot khác): `roster.json` (mỗi bot tự đăng ký + cập nhật identity) + `bus/` (hộp thư từng bot).
+3. **Sinh "prompt kích hoạt 2 kênh"** để dán vào agent của từng bot: kênh 1 = người↔bot (Telegram), kênh 2 = bot↔bot (file team).
 
 ## 2. Cách hoạt động
 
-Điện thoại → Telegram → script `listen` → **agent của bạn đọc, suy nghĩ, làm việc** → trả lời qua `send` → Telegram → điện thoại.
+- **Người ↔ bot:** điện thoại → Telegram → `listen.sh` → agent đọc, làm, trả lời qua `send.sh`. Idle = block trong HTTP call → **~0 token**.
+- **Bot ↔ bot:** agent ghi/đọc file trong `team/` (Telegram không cho bot đọc bot). Mỗi bot chạy `bus_listen.sh` song song để thức khi bot khác nhắn; gửi bằng `bus_send.sh`.
 
-Khi rảnh, agent block trong cú gọi HTTP của `listen` → **gần như 0 token**. Chi phí theo số tin nhắn, không theo thời gian bật.
+## 3. Nhiều bot / nhiều nền tảng (không conflict)
 
-## 3. Cần gì
+Mỗi bot có **Tên duy nhất** (= `@tag` + tên folder). Wizard ghi kit vào `team/agents/<tên>/` với `BOT_NAME=<tên>` → **lock, offset, config tách hẳn**. Nên bạn mở **Claude** setup bot A, mở **Codex** setup bot B… mỗi con 1 token + 1 folder, **không đè nhau**. (Trùng tên → wizard chặn.)
 
-- **Python 3** đã cài (Windows: nhớ tích *Add Python to PATH* khi cài).
-- Một **agent Claude Code / Antigravity** đang chạy trên máy bạn (đây mới là bộ não).
-- Một tài khoản **Telegram**.
+## 4. Kênh bot ↔ bot (team)
 
-## 4. Mở app
+- **`register.sh online`** — bot tự ghi/cập nhật mình vào `team/roster.json` (role, platform, status, last_seen). Roster **lớn dần** khi từng bot lên sóng.
+- **`bus_listen.sh`** — block tới khi có thư cho mình, in ra, đánh dấu đã đọc.
+- **`bus_send.sh <tên-bot> "…"`** — gửi riêng 1 bot. **`bus_send.sh all "…"`** — broadcast cả team (fan-out).
+- Mẫu điều phối: 1 bot **PM** (trả tin người không tag) giao việc cho nhiều **specialist** qua bus rồi tổng hợp — đúng kiểu KRONOS điều phối HEPHAESTUS.
 
-- **Windows:** double-click **`run.bat`** (lần đầu nó tự cài `customtkinter` rồi mở app).
-- **macOS / Linux:** double-click **`run.command`**, hoặc chạy `python3 app.py`.
+## 5. Cần gì
 
-## 5. Các bước cài đặt
+- **Python 3** (Windows: tích *Add Python to PATH*).
+- Các **agent Claude Code / Codex / Gemini CLI…** đang chạy trên máy (mỗi bot 1 agent).
+- Tài khoản **Telegram**. (Mode **git** cần thêm `git` nếu các bot ở khác máy.)
 
-**Bước 1 — Tạo bot.** Mở **@BotFather** trên Telegram → gõ `/newbot` → đặt tên → **chép token** (dạng `123456789:AAE...`).
+## 6. Mở app
 
-**Bước 2 — Tạo group + cho bot làm admin.** Tạo 1 **group** Telegram → add bot vào → vào *Edit → Administrators* cho bot làm **admin** (bắt buộc, để bot đọc được tin thường) → gõ 1 câu bất kỳ vào group.
-> ⚠️ Quên cho bot làm admin là lỗi #1 khiến bot không đọc được tin.
+- **Windows:** double-click **`run.bat`** (tự cài `customtkinter` lần đầu).
+- **macOS / Linux:** double-click **`run.command`**, hoặc `python3 app.py`.
 
-**Bước 3 — Kết nối (thẻ 1).** Dán **Bot Token** → bấm **🔎 Lấy Chat ID** (app tự bắt Chat ID từ tin bạn vừa gửi) → đặt **Tên agent** + **Role** (PM = trả mọi tin; DEV = chỉ trả `@anti`/`@all`) → chọn thư mục → **💾 Ghi bộ kit** → **✈️ Test gửi** để chắc bot nói được vào group.
+## 7. Các bước cài đặt
 
-**Bước 4 — Persona (thẻ 2).** Chọn **Nạp preset** (có sẵn nhiều nhân vật) hoặc tự viết nhân cách → **💾 Lưu persona**. Persona được lưu lại để gọi lại sau.
+1. **Team:** chọn **Thư mục team** + **mode** (`folder` = cùng máy, mặc định; `git` = khác máy) → **🏗 Dựng team**.
+2. **Thêm bot** (nút ➕): đặt **Tên** duy nhất + chọn **nền tảng** (Claude/Codex/…) + dán **Token** → **🔎 Chat ID** (nhắn 1 câu vào group rồi bấm) → bật **PM** nếu là bot điều phối → **Persona** (tự viết hoặc 📦 Nạp preset).
+3. **💾 Ghi kit bot này** → **✈️ Test gửi** (chắc bot vào được group).
+4. **📋 Tạo prompt** → copy → **dán vào agent của bot đó** (Claude Code/Codex…). Agent sẽ chạy `listen` + `bus_listen` + `register`.
+5. Lặp bước 2–4 cho từng bot.
+6. Nhắn từ điện thoại → bot trả lời; các bot tự điều phối nhau qua team. **Không API key, không tốn token.**
 
-**Bước 5 — Tạo & dán Prompt kích hoạt (thẻ 3).** Bấm **📋 Tạo & Copy** → app sinh đoạn prompt (nhân cách + cách vận hành vòng lặp + đường dẫn kit) và copy sẵn → **dán thẳng vào Claude Code / Antigravity của bạn**. Agent sẽ bắt đầu chạy `listen` và lắng nghe.
+## 8. Đèn trạng thái
 
-**Bước 6 — Remote từ điện thoại.** Nhắn vào group từ điện thoại → agent đọc, làm, trả lời. Xong!
+3 đèn + **🔄 Kiểm tra**:
+- **Telegram:** 🟢 `@bot` = token OK (`getMe`).
+- **Bộ não:** 🟢 = `listen` của bot đang chọn đang chạy (đọc lock file, **không** đụng Telegram → khỏi 409).
+- **Roster:** số bot đã đăng ký / đang online (đọc `team/roster.json`).
 
-## 6. Đèn trạng thái
-
-Trên cùng có 2 đèn + nút **🔄 Kiểm tra**:
-
-- **Telegram:** 🟢 `@tên_bot` = token hợp lệ; 🔴 = token sai/lỗi mạng.
-- **Bộ não:** 🟢 *đang lắng nghe* = agent đã chạy `listen` (kiểm bằng lock file trên máy, **không** đụng Telegram nên không gây lỗi 409); ⚪ = chưa chạy.
-- "Đã thông" hoàn toàn = cả 2 đèn 🟢 + bạn thấy agent trả lời khi nhắn vào group.
-
-## 7. Khi không chạy
+## 9. Khi không chạy
 
 Mở trình duyệt, thay `<TOKEN>`:
+1. **Webhook chiếm bot:** `.../getWebhookInfo` có `"url"` → `.../deleteWebhook`.
+2. **Privacy mode:** `.../getUpdates` rỗng → @BotFather `/setprivacy` → Disable → re-add admin.
+3. **HTTP 409:** chỉ 1 `listen.sh` mỗi token.
+4. **Sai Chat ID:** supergroup dạng `-1001234567890`.
 
-1. **Webhook chiếm bot.** Mở `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — nếu `"url"` không rỗng thì `getUpdates` không nhận gì. Sửa: mở `https://api.telegram.org/bot<TOKEN>/deleteWebhook`.
-2. **Privacy mode còn bật.** Gửi tin vào group rồi mở `https://api.telegram.org/bot<TOKEN>/getUpdates` — nếu `"result":[]` rỗng nghĩa là bot không đọc được bạn. Sửa: @BotFather → `/setprivacy` → chọn bot → **Disable** → re-add bot làm admin.
-3. **Hai listener cùng 1 bot = HTTP 409.** Chỉ chạy MỘT `listen` cho mỗi token. (Wizard chỉ kiểm lock, không poll, nên an toàn.)
-4. **Sai Chat ID.** Supergroup có dạng `-1001234567890` — lấy đúng từ getUpdates.
+## 10. Bảo mật
 
-## 8. Bảo mật
+Kit chứa **bot token** trong `config.sh`/`config.ps1` — giữ riêng tư, đừng commit/chia sẻ. Lộ thì rotate ở @BotFather.
 
-Bộ kit chứa **bot token** trong `config.sh`/`config.ps1` — giữ riêng tư, đừng commit/chia sẻ. Lộ token thì rotate ở @BotFather. Persona lưu ở `~/.chronos_forge/personas.json` (chỉ là văn bản, không có secret).
-
-## 9. Cấu trúc file
+## 11. Cấu trúc
 
 ```
-app.py             # Wizard (UI + logic; nhúng sẵn script kit)
-run.bat            # Mở trên Windows
-run.command        # Mở trên macOS/Linux
-requirements.txt   # customtkinter
+app.py · run.bat · run.command · requirements.txt
+~/telegram-team/                ← team (do app dựng)
+  agents/<tên-bot>/             ← kit RIÊNG mỗi bot (config + listen/send/read + register/bus_*)
+  team/roster.json              ← identity các bot (tự đăng ký)
+  team/bus/<tên-bot>/           ← hộp thư bot↔bot
 ```
-
-Bộ kit (`config` + `listen`/`send`/`read`, cả `.sh` lẫn `.ps1`) được app **tự ghi ra** thư mục bạn chọn khi bấm *Ghi bộ kit*.
 
 <br>
 
@@ -88,77 +90,79 @@ Bộ kit (`config` + `listen`/`send`/`read`, cả `.sh` lẫn `.ps1`) được a
 
 > 🇬🇧 English version. &nbsp;&nbsp; 🇻🇳 **Phiên bản tiếng Việt ở đầu trang ⬆**
 
-A tiny desktop wizard that lets you **remote-control your own AI coding agent (Claude Code / Antigravity) from your phone via Telegram**. Your agent is the "brain" (it uses its own existing login) — so **NO API key, ~0 tokens while idle**.
+A desktop wizard to **remote-control multiple AI coding agents (Claude Code / Codex / Gemini CLI…) from your phone via Telegram**, and to let **bots talk to each other** through a shared intermediate-file channel. Each agent is the "brain" (uses its own login) — so **NO API key, ~0 tokens while idle**.
 
 ---
 
 ## 1. What it is
 
-The app **never calls an LLM itself**. It does just two things:
+The app **never calls an LLM**. It does three things:
 
-1. **Writes a Telegram kit** (a `config` + `listen`/`send`/`read` scripts) that your agent uses as a pipe to Telegram.
-2. **Saves & recalls Personas** — it generates an "activation prompt" you paste into your agent; the agent then runs the Telegram loop with that persona.
+1. **Writes a per-bot Telegram kit** (config + `listen`/`send`/`read`) — each bot has a unique name → its own folder/lock/offset → **multiple bots never collide**.
+2. **Sets up a "team" channel** for **bot ↔ bot** (Telegram bots can't read other bots' messages): `roster.json` (each bot self-registers + updates its identity) + `bus/` (a per-bot inbox).
+3. **Generates a "2-channel activation prompt"** to paste into each bot's agent: channel 1 = human↔bot (Telegram), channel 2 = bot↔bot (team files).
 
 ## 2. How it works
 
-Phone → Telegram → `listen` script → **your agent reads, thinks, acts** → replies via `send` → Telegram → phone.
+- **Human ↔ bot:** phone → Telegram → `listen.sh` → the agent reads, acts, replies via `send.sh`. Idle = blocked on the HTTP call → **~0 tokens**.
+- **Bot ↔ bot:** agents read/write files in `team/` (Telegram won't let a bot read a bot). Each bot runs `bus_listen.sh` in parallel to wake when another bot pings it; it sends via `bus_send.sh`.
 
-While idle the agent is blocked on `listen`'s HTTP call → **near-zero tokens**. Cost scales with messages, not uptime.
+## 3. Many bots / many platforms (no conflict)
 
-## 3. Requirements
+Each bot has a **unique name** (= its `@tag` + folder name). The wizard writes its kit to `team/agents/<name>/` with `BOT_NAME=<name>` → **separate lock, offset, config**. So you open **Claude** to set up bot A, **Codex** to set up bot B… each with its own token + folder, **no overwrite**. (Duplicate names are blocked.)
 
-- **Python 3** installed (on Windows tick *Add Python to PATH* during install).
-- A running **Claude Code / Antigravity agent** on your machine (this is the brain).
-- A **Telegram** account.
+## 4. The bot ↔ bot channel (team)
 
-## 4. Run the wizard
+- **`register.sh online`** — a bot writes/updates itself in `team/roster.json` (role, platform, status, last_seen). The roster **grows gradually** as each bot comes online.
+- **`bus_listen.sh`** — blocks until there's mail for it, prints it, marks it read.
+- **`bus_send.sh <bot-name> "…"`** — message a single bot. **`bus_send.sh all "…"`** — broadcast to the whole team (fan-out).
+- Coordination pattern: one **PM** bot (answers untagged human messages) delegates to many **specialists** over the bus, then aggregates — exactly the KRONOS-coordinates-HEPHAESTUS pattern.
 
-- **Windows:** double-click **`run.bat`** (it auto-installs `customtkinter` on first run, then opens the app).
-- **macOS / Linux:** double-click **`run.command`**, or run `python3 app.py`.
+## 5. Requirements
 
-## 5. Step-by-step setup
+- **Python 3** (on Windows tick *Add Python to PATH*).
+- Your **Claude Code / Codex / Gemini CLI…** agents running on the machine (one agent per bot).
+- A **Telegram** account. (The **git** mode also needs `git` if bots run on different machines.)
 
-**Step 1 — Create the bot.** Open **@BotFather** in Telegram → `/newbot` → name it → **copy the token** (`123456789:AAE...`).
+## 6. Run the wizard
 
-**Step 2 — Create a group + make the bot admin.** Create a Telegram **group** → add the bot → *Edit → Administrators* and make the bot an **admin** (required so it can read plain messages) → send any message in the group.
-> ⚠️ Forgetting admin is the #1 reason the bot can't read messages.
+- **Windows:** double-click **`run.bat`** (auto-installs `customtkinter` first run).
+- **macOS / Linux:** double-click **`run.command`**, or `python3 app.py`.
 
-**Step 3 — Connect (card 1).** Paste the **Bot Token** → click **🔎 Get Chat ID** (it auto-detects the Chat ID from your message) → set an **Agent name** + **Role** (PM = answers everything; DEV = only `@anti`/`@all`) → pick a folder → **💾 Write kit** → **✈️ Test send** to confirm the bot can post.
+## 7. Step-by-step setup
 
-**Step 4 — Persona (card 2).** Pick **Load preset** (many ready-made characters) or write your own persona → **💾 Save persona**. Personas are saved so you can recall them later.
+1. **Team:** pick a **Team folder** + **mode** (`folder` = same machine, default; `git` = different machines) → **🏗 Build team**.
+2. **Add a bot** (➕): give it a unique **Name** + pick a **platform** (Claude/Codex/…) + paste its **Token** → **🔎 Chat ID** (send a message in the group, then click) → turn on **PM** if it's the coordinator → set a **Persona** (write it or 📦 Load preset).
+3. **💾 Write this bot's kit** → **✈️ Test send** (confirm it can post).
+4. **📋 Generate prompt** → copy → **paste into that bot's agent** (Claude Code/Codex…). The agent will run `listen` + `bus_listen` + `register`.
+5. Repeat steps 2–4 for each bot.
+6. Message from your phone → the bot replies; bots coordinate with each other over the team channel. **No API key, no tokens.**
 
-**Step 5 — Generate & paste the Activation prompt (card 3).** Click **📋 Generate & Copy** → it produces the prompt (persona + how to run the loop + kit path) and copies it → **paste it into your Claude Code / Antigravity agent**. The agent will start running `listen` and listening.
+## 8. Status indicators
 
-**Step 6 — Remote from your phone.** Message the group from your phone → the agent reads, acts, replies. Done!
+Three indicators + a **🔄 Check** button:
+- **Telegram:** 🟢 `@bot` = valid token (`getMe`).
+- **Brain:** 🟢 = the selected bot's `listen` is running (reads a lock file, does **not** poll Telegram → no 409).
+- **Roster:** how many bots are registered / online (reads `team/roster.json`).
 
-## 6. Status indicators
-
-Two indicators at the top + a **🔄 Check** button:
-
-- **Telegram:** 🟢 `@bot_name` = valid token; 🔴 = bad token/network error.
-- **Brain:** 🟢 *listening* = the agent's `listen` is running (detected via a local lock file, it does **not** poll Telegram so it can't cause a 409); ⚪ = not running.
-- Fully connected = both 🟢 + you see the agent reply when you message the group.
-
-## 7. Troubleshooting
+## 9. Troubleshooting
 
 In a browser, replace `<TOKEN>`:
+1. **Webhook hijack:** `.../getWebhookInfo` has a `"url"` → `.../deleteWebhook`.
+2. **Privacy mode:** `.../getUpdates` is empty → @BotFather `/setprivacy` → Disable → re-add as admin.
+3. **HTTP 409:** only one `listen.sh` per token.
+4. **Wrong Chat ID:** a supergroup looks like `-1001234567890`.
 
-1. **A webhook is hijacking it.** Open `.../getWebhookInfo` — if `"url"` is non-empty, `getUpdates` returns nothing. Fix: open `.../deleteWebhook`.
-2. **Privacy mode still on.** Send a message, open `.../getUpdates` — empty `"result":[]` means the bot can't read you. Fix: @BotFather → `/setprivacy` → pick the bot → **Disable** → re-add as admin.
-3. **Two listeners on one bot = HTTP 409.** Run only ONE `listen` per token. (The wizard only checks a lock, never polls, so it's safe.)
-4. **Wrong Chat ID.** A supergroup looks like `-1001234567890` — copy it exactly from getUpdates.
+## 10. Security
 
-## 8. Security
+The kit holds your **bot token** in `config.sh`/`config.ps1` — keep it private, never commit/share. If it leaks, rotate it in @BotFather.
 
-The kit holds your **bot token** in `config.sh`/`config.ps1` — keep it private, never commit/share. If it leaks, rotate it in @BotFather. Personas are stored in `~/.chronos_forge/personas.json` (plain text, no secrets).
-
-## 9. Files
+## 11. Files
 
 ```
-app.py             # the wizard (UI + logic; scripts embedded)
-run.bat            # launcher for Windows
-run.command        # launcher for macOS/Linux
-requirements.txt   # customtkinter
+app.py · run.bat · run.command · requirements.txt
+~/telegram-team/                ← the team (created by the app)
+  agents/<bot-name>/            ← per-bot kit (config + listen/send/read + register/bus_*)
+  team/roster.json              ← bot identities (self-registered)
+  team/bus/<bot-name>/          ← bot↔bot inbox
 ```
-
-The kit (`config` + `listen`/`send`/`read`, both `.sh` and `.ps1`) is **written out** by the app to your chosen folder when you click *Write kit*.
